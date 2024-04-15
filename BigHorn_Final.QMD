@@ -1,0 +1,334 @@
+---
+title:  "Bighorn Final Proj."
+format: html
+editor: visual
+by:     Eric, Amar, Larisa, Carter. 
+---
+
+```{r}
+
+library(Rsagacmd)
+library(purrr)
+library(lidR)
+library(future)
+library(terra)
+library(mapview)
+library(sp)
+library(sf)
+library(tidyverse)
+library(raster)
+library(future)
+
+
+las <- readLAScatalog("Savona_SC.las")
+plot(las, mapview = TRUE)
+
+plan(multisession)
+
+opt_output_files(las) <- "01_retile/{XLEFT}_{YBOTTOM}"
+opt_chunk_size(las) <- 250
+opt_chunk_buffer(las) <- 0
+opt_chunk_alignment(las) <- c(250, 250)
+plot(las, chunk_pattern = TRUE)
+
+las_tiled <- catalog_retile(las)
+View(las_tiled)
+plot(las_tiled, mapview = TRUE)
+
+```
+
+```{r}
+
+library(Rsagacmd)
+library(sf)
+library(tidyverse)
+
+opt_filter(las_tiled) <- ""
+opt_chunk_size(las_tiled) <- 0
+opt_chunk_buffer(las_tiled) <- 15
+opt_output_files(las_tiled) <- "02_ground/{*}"
+las_ground <- classify_ground(las_tiled, algorithm = csf(sloop_smooth = TRUE))
+
+saga_path <- "C:/SAGA-GIS/saga-9.3.2_x64/saga_cmd.exe"
+saga <- saga_gis(saga_path, raster_format = "GeoTIFF")
+
+```
+
+```{r}
+
+opt_output_files(las_ground) <- file.path(tempdir(), "dem_{*}")
+dem <- rasterize_terrain(las_ground, res = 2.5, algorithm = tin())
+dir.create("ta", showWarnings = FALSE)
+dem <- writeRaster(dem, "ta/dem.tif", overwrite = TRUE)
+
+```
+
+```{r}
+
+saga$ta_preprocessor$sink_removal
+View(tidy(saga$ta_preprocessor$sink_removal))
+dem_preproc <- saga$ta_preprocessor$sink_removal(dem)
+sources(dem_preproc)
+
+
+dem_preproc <- saga$ta_preprocessor$sink_removal(
+  dem = dem, dem_preproc = "ta/dem_preproc.tif")
+sources(dem_preproc)
+saga$ta_morphometry$slope_aspect_curvature
+View(tidy(saga$ta_morphometry$slope_aspect_curvature))
+
+
+slope_aspect <- saga$ta_morphometry$slope_aspect_curvature(
+  elevation = dem_preproc, slope = "ta/slope.tif", aspect = "ta/aspect.tif", 
+  method = 6, unit_slope = "radians", unit_aspect = "radians",
+  .all_outputs = FALSE)
+
+
+mrvbf_thresh <- mrvbf_threshold(res = res(dem)[1])
+mrvbf <- saga$ta_morphometry$multiresolution_index_of_valley_bottom_flatness_mrvbf(
+  dem = dem_preproc, mrvbf = "ta/mrvbf.tif", mrrtf = "ta/mrrtf.tif", 
+  t_slope = mrvbf_thresh)
+
+
+tri <- saga$ta_morphometry$terrain_ruggedness_index_tri(
+  dem = dem_preproc, tri = "ta/tri.tif")
+
+
+tpi <- saga$ta_morphometry$topographic_position_index_tpi(dem = dem_preproc, tpi = "ta/tpi.tif")
+
+tca <- saga$ta_hydrology$flow_accumulation_top_down(
+  elevation = dem_preproc, flow = "ta/tca_TEMP.tif", .all_outputs = FALSE)
+
+sca <- saga$ta_hydrology$flow_width_and_specific_catchment_area(
+  dem = dem_preproc, tca = tca, sca = "ta/sca_TEMP.tif", .all_outputs = FALSE)
+
+
+twi <- saga$ta_hydrology$topographic_wetness_index(
+  slope = slope_aspect$slope, area = sca, twi = "ta/twi.tif")
+
+
+so <- saga$ta_channels$strahler_order(
+  dem = dem_preproc, strahler = "ta/strahler_TEMP.tif", .all_outputs = FALSE)
+
+
+cn <- saga$ta_channels$channel_network(
+  elevation = dem_preproc, init_grid = so, init_value = 5,
+  chnlntwrk = "ta/cn_TEMP.tif", .all_outputs = FALSE)
+
+
+openness <- saga$ta_lighting$topographic_openness(
+  dem = dem_preproc, pos = "ta/openness_pos.tif", neg = "ta/openness_neg.tif")
+
+
+model_layers <- c(
+  slope_aspect$slope, slope_aspect$aspect, mrvbf$mrvbf, mrvbf$mrrtf,
+  tri, twi, openness$pos, openness$neg, tpi)
+
+
+```
+
+```{r}
+
+library(ranger) 
+library(mlr3verse)
+library(mlr3spatial)
+library(mlr3spatiotempcv)
+library(sf)
+library(terra, exclude = "resample")
+library(ggplot2)
+
+
+
+boundary <- st_read("Savona_project boundary.gpkg")
+points <- st_read("Sheep_locations.gpkg")
+plot(boundary)
+plot(points)
+
+points <- na.omit(points)
+plot(boundary)
+plot(points, add = TRUE, col = "red", pch = 20)
+
+
+sf_sheep <- st_read("Sheep_locations.gpkg")
+bighorn <- vect(sf_sheep)
+mapview(bighorn)
+
+
+ggplot() +
+  geom_sf(data = boundary) +
+  geom_sf(data = points, color = "red", shape = 20)
+
+
+
+folder_path <- "C:\\Users\\carte\\Downloads\\Eco Modelling FInal Proj\\ta"
+
+tif_files <- list.files(folder_path, pattern = ".tif$", full.names = TRUE)
+
+
+model_layers <- rast(tif_files)
+
+
+
+data_extract <- terra::extract(model_layers, bighorn, fun = "mean", bind = TRUE) %>% 
+  st_as_sf() %>% 
+  na.omit() %>% 
+  mutate(presence = factor(presence, levels = c(TRUE, FALSE)))
+plot(data_extract)
+
+data_extract_tsk <- as_task_classif_st(data_extract, target = "presence", positive = "TRUE")
+
+files_to_remove <- list.files("ta/", pattern = "*._TEMP.tif$", full.names = TRUE)
+file.remove(files_to_remove)
+
+saga_remove_tmpfiles()
+
+plot(bighorn, max.plot = 11)
+
+
+gpkg_path <- "\\Users\\carte\\Downloads\\Eco Modelling FInal Proj\\Sheep_locations.gpkg"
+gpkg_layers <- st_layers(gpkg_path)
+print(gpkg_layers)
+
+
+rast_files <- list.files("ta", pattern = ".tif$", full.names = TRUE)
+rast_files <- grep("dem", rast_files, value = TRUE, invert = TRUE)
+model_layers <- rast(rast_files)
+
+
+
+```
+
+```{r}
+
+library(ranger) 
+library(mlr3verse)
+library(mlr3spatial)
+library(mlr3spatiotempcv)
+library(sf)
+library(terra, exclude = "resample")
+
+
+folder_path <- "C:\\Users\\carte\\Downloads\\Eco Modelling FInal Proj\\ta"
+tif_files <- list.files(folder_path, pattern = ".tif$", full.names = TRUE)
+model_layers <- rast(tif_files)
+view(model_layers)
+
+
+outer_cores <- min(1, availableCores())
+inner_cores <- floor(availableCores() / outer_cores)
+
+
+plan(list(
+  tweak("multisession", workers = outer_cores),
+  tweak("multisession", workers = inner_cores)
+))
+
+
+lrn_rf_tune_prob <- lrn("classif.ranger", 
+                        num.trees = to_tune(100, 2000), predict_type = "prob",
+                        mtry = to_tune(1, length(data_extract_tsk$feature_names)),
+                        importance = "impurity")
+
+
+avail_msrs <- as.data.table(msrs())[
+  task_type == "classif" & 
+    predict_type == "prob" &
+    task_properties == "twoclass"]
+
+View(avail_msrs)
+
+
+
+df_design <- expand.grid(
+  num.trees = c(100, 250, 500, 750, 1000, 1500, 2000),
+  mtry = 1:length(data_extract_tsk$feature_names))
+
+dt_design <- data.table(df_design)
+
+tnr_design <- tnr("design_points", design = dt_design)
+
+
+cv_inner <- rsmp("cv", folds = 10)
+cv_outer <- rsmp("spcv_coords", folds = 4)
+
+
+reqrd_msrs <- ("classif.prauc")
+
+at_prob <- auto_tuner(
+  tuner = tnr_design,
+  learner = lrn_rf_tune_prob,
+  resampling = cv_inner,
+  measure = msr("classif.prauc"),
+  terminator = trm("none")
+)
+
+
+rr_prob <- resample(data_extract_tsk, at_prob, cv_outer, store_models = TRUE)
+
+
+rr_prob$aggregate(msrs(reqrd_msrs))
+
+
+conf_prob <- rr_prob$prediction()$confusion
+
+
+
+rr_prob_results <- extract_inner_tuning_results(rr_prob)
+
+
+mod_scores_prob <- rr_prob$score(msrs(reqrd_msrs))
+View(mod_scores_prob)
+
+
+
+best_lrn_prob <- rr_prob$learners[[which.min(mod_scores_prob$classif.prauc)]]$learner
+
+
+imp <- best_lrn_prob$importance()
+imp <- data.frame(Variable = factor(names(imp), levels = rev(unique(names(imp)))),
+                  Importance = imp, row.names = NULL)
+
+
+imp_plot_prob <- ggplot(imp, aes(x = Importance, y = Variable)) + 
+  geom_bar(stat = "identity")
+
+imp_plot_prob
+
+
+write.ftable(ftable(conf_prob), file = "confusion_matrix_prob.csv", sep = ",",
+             quote = FALSE)
+
+
+ggsave("Variable importance_prob.png", imp_plot_prob, width = 1920, height = 1440,
+       units = "px", dpi = 300)
+
+
+
+ranger_model <- best_lrn_prob$model
+fun <- function(model, ...) predict(model, ...)$predictions
+
+prediction_prob_terra <- terra::predict(
+  model_layers, ranger_model, fun = fun, na.rm = TRUE)
+
+prob_files <- paste0(names(prediction_prob_terra), "_probability.tif")
+prediction_prob_terra <- writeRaster(
+  prediction_prob_terra, prob_files, overwrite = TRUE)
+
+entropy_step1 <- sapp(prediction_prob_terra, function(x) x * log(x))
+entropy_step2 <- -app(entropy_step1, fun = sum, cores = availableCores())
+plot(entropy_step2)
+entropy_step2 <- writeRaster(entropy_step2, "entropy.tif", overwrite = TRUE)
+
+
+
+plot(prediction_prob_terra)
+
+
+check <- app(prediction_prob_terra, fun = sum, na.rm = TRUE, 
+             cores = availableCores())
+
+plot(check, type = "classes")
+
+```
+
+\
